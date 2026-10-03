@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash, createHmac } from 'node:crypto';
 import test from 'node:test';
-import { PluginApiError, PluginClient, createSignedTransport, definePlugin, signPluginRequest } from '../index.mjs';
+import { PluginApiError, PluginClient, createResourceTransport, createSignedTransport, definePlugin, signPluginRequest } from '../index.mjs';
 
 const secret = 'a'.repeat(64);
 const path = '/api/v1/plugins/sample_chat/conversations:batch';
@@ -101,4 +101,83 @@ test('plugin lifecycle declaration keeps required callbacks', async () => {
   assert.equal(await plugin.isConfigured({ channel: 'demo' }), true);
   assert.equal(Object.isFrozen(plugin), true);
   assert.throws(() => definePlugin({ id: 'bad/id', start: async () => {} }), TypeError);
+});
+
+test('task batches use signed task endpoint and preserve create-only acknowledgements', async () => {
+  const requests = [];
+  const transport = createSignedTransport({ baseUrl: 'http://127.0.0.1:8000', pluginId: 'sample_chat',
+    secret, resource: 'tasks', fetchImpl: async (url, options) => {
+      requests.push([url, options]);
+      const tasks = JSON.parse(options.body).tasks;
+      return { status: 200, json: async () => ({ source_id: 'plugin_sample_chat', created: tasks.length,
+        updated: 0, unchanged: 0, items: tasks.map(task => ({ external_id: task.external_id,
+          task_id: task.external_id, action: 'created', status: 'NEW', active: true })) }) };
+    } });
+  const client = new PluginClient({ taskTransport: transport });
+  const tasks = Array.from({ length: 501 }, (_, n) => ({ external_id: `task-${n}`, title: `Sample task ${n}` }));
+  const result = await client.sendTasks(tasks);
+  assert.equal(result.created, 501);
+  assert.deepEqual(requests.map(([, options]) => JSON.parse(options.body).tasks.length), [500, 1]);
+  assert.match(requests[0][0], /\/tasks:batch$/);
+  assert.equal(JSON.parse(requests[0][1].body).close_missing, false);
+  await assert.rejects(client.sendTasks([{ ...tasks[0], priority: 'URGENT' }]), /priority/);
+  assert.equal(requests.length, 2);
+});
+
+test('plugin status uses its signed endpoint', async () => {
+  const requests = [];
+  const client = new PluginClient({ statusTransport: createSignedTransport({
+    baseUrl: 'http://127.0.0.1:8000', pluginId: 'sample_chat', secret, resource: 'status',
+    fetchImpl: async (url, options) => { requests.push([url, options]); return { status: 200,
+      json: async () => ({ status: 'BUSY' }) }; },
+  }) });
+  await client.reportStatus('BUSY', 'Loading');
+  assert.match(requests[0][0], /\/status$/);
+  assert.deepEqual(JSON.parse(requests[0][1].body), { status: 'BUSY', message: 'Loading' });
+});
+
+test('resource worker checks availability before get and can wake waiting work', async () => {
+  const requests = [];
+  const pending = [
+    {event_id: 'event-1', reference: 'ARC-42', resource_type: 'task', operation: 'availability', claim_id: 'claim-1'},
+    {event_id: 'event-1', reference: 'ARC-42', resource_type: 'task', operation: 'get', claim_id: 'claim-2'},
+  ];
+  const controller = new AbortController();
+  let completed = 0;
+  const client = new PluginClient({resourceTransport: createResourceTransport({
+    baseUrl: 'http://127.0.0.1:8000', pluginId: 'sample_chat', secret,
+    fetchImpl: async (url, options) => {
+      const payload = JSON.parse(options.body);
+      requests.push({url, payload});
+      if (url.endsWith('resource-jobs:claim')) {
+        const job = pending.shift();
+        return {status: 200, json: async () => ({jobs: job ? [job] : []})};
+      }
+      if (url.endsWith('resource-jobs:complete') && ++completed === 2) controller.abort();
+      return {status: 200, json: async () => ({state: 'READY', requeued: 1})};
+    },
+  })});
+  await client.runResourceWorker({
+    availability: async () => 'available',
+    get: async () => ({type: 'task', title: 'Sample task', content: 'Review sample data',
+      url: 'https://tracker.example.test/ARC-42', version: '2', updated_at: '2026-10-01T10:00:00Z'}),
+  }, {signal: controller.signal});
+  const completions = requests.filter(call => call.url.endsWith('resource-jobs:complete'));
+  assert.equal(completions.length, 2);
+  assert.equal(completions[0].payload.status, 'available');
+  assert.equal(completions[1].payload.resource.version, '2');
+  await client.notifyResourcesAvailable();
+  assert.equal(requests.at(-1).payload.available, true);
+});
+
+test('search job is completed with search identity and results', async () => {
+  let completion;
+  const client = new PluginClient({resourceTransport: {
+    claim: async () => ({jobs: []}),
+    complete: async payload => { completion = payload; return {state: 'READY'}; },
+    notify: async () => ({requeued: 0}),
+  }});
+  const job = {operation: 'search', search_id: 'search-1', query: 'sample', claim_id: 'claim-1'};
+  await client.completeResourceJob(job, {status: 'available', results: []});
+  assert.deepEqual(completion, {search_id: 'search-1', claim_id: 'claim-1', status: 'available', results: []});
 });
